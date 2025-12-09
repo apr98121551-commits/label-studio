@@ -1,87 +1,241 @@
 # Local Files Storage
 
 ## Overview
-Local Files storage allows self hosted Label Studio deployments to serve and synchronize media files directly from the host file system. Projects can reference files with URLs such as `/data/local-files/?d=dataset/image.jpg`, while the backend enforces that every requested path stays inside `LOCAL_FILES_DOCUMENT_ROOT` and that only users with access to the corresponding storage project can download the file. The feature is disabled by default because serving arbitrary local files is a security risk; administrators must opt in via environment variables and project settings.
+
+Local Files storage lets self-hosted Label Studio read media (images, audio, video, documents) directly from the server's filesystem and write annotation results back to disk. It's designed for air-gapped environments or workflows where data cannot leave the host machine.
+
+**Three core operations:**
+1. **Import/Sync** – scan a directory, create tasks pointing to local files
+2. **Serve** – stream file bytes to the labeling UI via `/data/local-files/?d=...`
+3. **Export** – write completed annotations as JSON files to a target directory
 
 ## Architecture
+
 ```mermaid
-flowchart TD
-    env["Configuration
-    ENABLE_LOCAL_FILES_STORAGE
-    LOCAL_FILES_SERVING_ENABLED
-    LOCAL_FILES_DOCUMENT_ROOT"] --> serializer["LocalFiles serializers
-    normalize_storage_path
-    validate_connection"]
-    serializer --> storageModel["LocalFilesImportStorage
-    LocalFilesExportStorage"]
-    storageModel --> migration["0022_normalize_localfiles_paths
-    canonical data backfill"]
-    storageModel --> view["/data/local-files endpoint
-    localfiles_data"]
-    view --> permissionCheck["Prefix match vs normalized storage.path
-    project permissions enforced"]
-    frontend["Storage settings UI
-    localFiles.tsx"] --> serializer
+flowchart TB
+    subgraph Configuration
+        ENV["Environment variables
+        LOCAL_FILES_SERVING_ENABLED
+        LOCAL_FILES_DOCUMENT_ROOT"]
+        AUTO["Community auto-detect
+        mydata / label-studio-data"]
+    end
+
+    subgraph "Import Flow"
+        UI_IMPORT["UI: Add Source Storage"] --> SERIALIZER["Serializer
+        normalize path
+        validate_connection"]
+        SERIALIZER --> IMPORT_STORAGE["LocalFilesImportStorage"]
+        IMPORT_STORAGE --> SYNC["Sync button"]
+        SYNC --> ITER["iter_objects
+        scan directory"]
+        ITER --> |use_blob_urls=true| BLOB_TASK["Create task with URL
+        /data/local-files/?d=path"]
+        ITER --> |use_blob_urls=false| JSON_TASK["Read JSON file
+        as task definition"]
+        BLOB_TASK --> TASK_DB["Tasks in DB"]
+        JSON_TASK --> TASK_DB
+        TASK_DB --> LINK["LocalFilesImportStorageLink"]
+    end
+
+    subgraph "File Serving Flow"
+        LABEL_UI["Labeling UI requests
+        /data/local-files/?d=relative/path"] --> VIEW["localfiles_data view"]
+        VIEW --> AUTH["Check authentication"]
+        AUTH --> PATH_CHECK["Normalize path
+        safe_join with DOCUMENT_ROOT"]
+        PATH_CHECK --> PERM["Find storages where
+        storage.path is prefix of file dir"]
+        PERM --> PROJECT_PERM["Check project.has_permission"]
+        PROJECT_PERM --> |allowed| SERVE["Stream file with ETag
+        RangedFileResponse"]
+        PROJECT_PERM --> |denied| FORBIDDEN["403 Forbidden"]
+        PATH_CHECK --> |not found| NOTFOUND["404 Not Found"]
+    end
+
+    subgraph "Export Flow"
+        ANNOTATION["Annotation saved"] --> SIGNAL["post_save signal"]
+        SIGNAL --> EXPORT_STORAGE["LocalFilesExportStorage
+        save_annotation"]
+        EXPORT_STORAGE --> WRITE["Write JSON to
+        storage.path/annotation_id.json"]
+        WRITE --> EXPORT_LINK["LocalFilesExportStorageLink"]
+        DELETE["Annotation deleted"] --> DEL_SIGNAL["pre_delete signal"]
+        DEL_SIGNAL --> DEL_FILE["delete_annotation
+        removes JSON file"]
+    end
+
+    ENV --> SERIALIZER
+    AUTO --> ENV
 ```
 
-## Key Features
-- **Canonical paths everywhere**: `normalize_storage_path` trims whitespace, converts backslashes, collapses duplicate separators, and runs `os.path.normpath` before any storage is saved or validated.
-- **Safety checks**: `validate_connection` rejects paths outside `LOCAL_FILES_DOCUMENT_ROOT`, paths equal to the document root, and any configuration made while `LOCAL_FILES_SERVING_ENABLED` is false.
-- **Efficient serving**: `/data/local-files` uses a database level prefix filter (`_full_path__startswith=F('path')`) plus per project permission checks so it scales to thousands of storages.
-- **Actionable validation errors**: serializers convert nested Django/DRF error payloads into plain dictionaries/lists for the UI, so users see the exact reason a storage path failed validation.
-- **UI guidance**: the React provider warns when local serving is disabled, suggests default paths, and reminds users to mount host directories in Docker-based setups.
+## Key Concepts
+
+### Storage Models
+
+| Model | Purpose |
+|-------|---------|
+| `LocalFilesMixin` | Shared fields (`path`, `regex_filter`, `use_blob_urls`) and validation logic |
+| `LocalFilesImportStorage` | Source storage - scans directories, creates tasks |
+| `LocalFilesExportStorage` | Target storage - writes annotations as JSON files |
+| `LocalFilesImportStorageLink` | Links tasks to import storage (tracks which file created which task) |
+| `LocalFilesExportStorageLink` | Links annotations to export storage (tracks exported files) |
+
+### Import Modes
+
+When syncing an import storage, `use_blob_urls` determines how files become tasks:
+
+- **`use_blob_urls=True` (default "Files" mode)**: Each file becomes a task with a single data field pointing to `/data/local-files/?d=<relative_path>`. Best for labeling images, audio, video.
+
+- **`use_blob_urls=False` ("Tasks" mode)**: Each `.json`/`.jsonl` file is parsed as task definitions. Use this when your tasks have complex structures or multiple data fields.
+
+### Path Handling
+
+All storage paths are **normalized** before saving:
+- Trailing slashes removed (`/data/images/` → `/data/images`)
+- Backslashes converted to OS separator (`C:\data` → `C:/data` on Linux)
+- Redundant separators collapsed (`/data//images` → `/data/images`)
+
+This prevents 404 errors caused by path mismatches between stored paths and request paths.
+
+### Permission Model
+
+The `/data/local-files/?d=...` endpoint enforces:
+1. User must be authenticated
+2. `LOCAL_FILES_SERVING_ENABLED` must be `true`
+3. Requested file's directory must be inside at least one `LocalFilesImportStorage.path`
+4. User must have permission on that storage's project
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOCAL_FILES_SERVING_ENABLED` | `false` | Must be `true` to serve files via `/data/local-files/` |
+| `LOCAL_FILES_DOCUMENT_ROOT` | `/` (root) | Base directory; all storage paths must be subdirectories |
+| `ENABLE_LOCAL_FILES_STORAGE` | `true` | Whether Local Files appears as a storage option |
+
+Variables can be prefixed with `LABEL_STUDIO_` or `HEARTEX_` (checked in that order).
+
+### Community Edition Auto-Detection
+
+When both `LOCAL_FILES_DOCUMENT_ROOT` and `LOCAL_FILES_SERVING_ENABLED` are unset, Community Edition automatically searches for `mydata` or `label-studio-data` directories in the current working directory. If found, it enables local file serving with that directory as the document root.
+
+**Docker shortcut:** Mount your host folder to `/label-studio/mydata` inside the container to enable local files without setting any environment variables.
+
+### Production Setup
+
+```bash
+export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
+export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/data/labelstudio
+
+# Directory structure:
+# /data/labelstudio/           ← DOCUMENT_ROOT
+# /data/labelstudio/project1/  ← Storage path for project 1
+# /data/labelstudio/project2/  ← Storage path for project 2
+```
 
 ## Usage
 
-### Configuration and environment variables
-1. **Where settings come from**:<br/>
-   - `ENABLE_LOCAL_FILES_STORAGE` controls whether Local Files appears as a storage type in the UI (defaults to `true`).<br/>
-   - `LOCAL_FILES_SERVING_ENABLED` and `LOCAL_FILES_DOCUMENT_ROOT` are read via `get_env` / `get_bool_env`, which look at three names in order: `LABEL_STUDIO_<NAME>`, `HEARTEX_<NAME>`, and `<NAME>` itself. For example, all of these are valid and equivalent:<br/>
-     - `LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/absolute/path/to/data`<br/>
-     - `HEARTEX_LOCAL_FILES_DOCUMENT_ROOT=/absolute/path/to/data`<br/>
-     - `LOCAL_FILES_DOCUMENT_ROOT=/absolute/path/to/data`.<br/>
-   - If no document root is configured, Django falls back to the filesystem root (`/`), but Local Files will still be unusable until you either set a safer root or allow Community auto detection to override it.
-2. **Community auto detection**:<br/>
-   - In the Community edition, when *both* `LOCAL_FILES_DOCUMENT_ROOT` and `LOCAL_FILES_SERVING_ENABLED` are unset, `core.settings.base` calls `autodetect_local_files_root()` from `localfiles.functions`.<br/>
-   - This helper searches for existing `mydata` or `label-studio-data` directories relative to the current working directory. If it finds one, it sets `LOCAL_FILES_DOCUMENT_ROOT` to that path and turns `LOCAL_FILES_SERVING_ENABLED` on automatically, logging a short hint to the console.<br/>
-   - Error messages from `validate_connection()` and the Local Files UI both reference this behavior so operators understand why Local Files may have turned on “by itself” in a fresh Community install.
-3. **Explicit enablement (recommended for production)**:<br/>
-   ```bash
-   export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
-   export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/absolute/path/to/data
-   ```<br/>
-   Restart Label Studio after exporting the variables (or configure them through your process manager).
+### Creating Tasks with Local Files
 
-### Creating and using a Local Files storage
-4. **Prepare the directory tree**:<br/>
-   - The document root must exist on the host machine.<br/>
-   - Each storage path must be a subdirectory of the document root (for example `/absolute/path/to/data/dataset_a`).<br/>
-   - Use POSIX forward slashes in task data (`/data/local-files/?d=dataset_a/image_1.jpg`). The backend will normalize Windows style paths when you configure the storage.
-5. **Configure the storage in the UI** (`Settings → Storage → Add Source Storage → Local files`):<br/>
-   - The form reads `window.APP_SETTINGS.local_files_document_root` so it can suggest a default path and placeholder like `"<document_root>/your-subdirectory"`.<br/>
-   - The schema enforces a non empty absolute path and the description reminds the user that the path must start with the configured document root to pass backend validation.<br/>
-   - If `LOCAL_FILES_SERVING_ENABLED` is false, a destructive alert explains how to enable it. Community Edition users get extra tips about `mydata` and `label-studio-data` convenience folders both for bare metal and containers.
-6. **Verify access**:<br/>
-   - After saving the storage, open `http(s)://<host>/data/local-files/?d=<relative/path>` in a browser. Successful loads confirm both permissions and hostname level CORS settings.<br/>
-   - When importing tasks manually, remember to use relative URLs (everything after `/data/local-files/?d=`). The backend joins this relative segment with `LOCAL_FILES_DOCUMENT_ROOT` via `safe_join` and then ensures the resulting directory matches at least one storage path prefix before serving the file.
+1. **Configure import storage** in project Settings → Cloud Storage → Add Source Storage → Local Files
+2. Set **Absolute local path** to a subdirectory of `LOCAL_FILES_DOCUMENT_ROOT`
+3. Choose import method:
+   - **Files**: auto-create one task per media file
+   - **Tasks**: read JSON/JSONL files as task definitions
+4. Click **Sync** to scan the directory and create tasks
+
+### Manual Task Import
+
+When importing tasks via JSON, reference local files with:
+
+```json
+{
+  "data": {
+    "image": "/data/local-files/?d=project1/images/photo.jpg",
+    "audio": "/data/local-files/?d=project1/audio/recording.wav"
+  }
+}
+```
+
+The path after `?d=` is relative to `LOCAL_FILES_DOCUMENT_ROOT`.
+
+### Exporting Annotations
+
+1. Configure **target storage** in project Settings → Cloud Storage → Add Target Storage → Local Files
+2. Annotations are automatically written as JSON when saved
+3. Files are named `<annotation_id>.json` inside the storage path
 
 ## API Reference
-- `LocalFilesImportStorage` and `LocalFilesExportStorage` live in `models.py` and inherit from `ProjectStorageMixin`. The import storage generates either blob URLs or JSON tasks depending on configuration.
-- REST endpoints for CRUD, sync, and form layout are defined in `api.py` and exposed under `/api/storages/localfiles/...`.
-- `/data/local-files/` (see `core/views.py`) is the only endpoint that serves binary content. It requires authentication and re-checks both project permissions and on-disk existence every request.
 
-## Development
-- Key files:<br/>
-  - `models.py`: storage models, normalization helper, and validation logic.<br/>
-  - `serializers.py`: DRF serializers that call `normalize_storage_path` and convert validation errors via `_stringify_detail`.<br/>
-  - `migrations/0022_normalize_localfiles_paths.py`: data migration that retrofits canonical paths for existing storages without importing models at import time.<br/>
-  - `web/apps/labelstudio/src/pages/Settings/StorageSettings/providers/localFiles.tsx`: frontend provider that surfaces environment state and default path hints.<br/>
-  - `tests/test_localfiles_serializers.py`, `tests/test_localfiles_view.py`, and `tests/test_localfiles_validation.py`: cover serializers, `/data/local-files` endpoint, and `validate_connection`.
-- Canonical path logic is intentionally duplicated inside the migration to avoid importing Django models when apps are not ready. Keep any future migrations copy-paste aligned with `normalize_storage_path`.
-- When adding new local storage features, update both backend validation (ideally in one shared mixin) and the UI provider so users see consistent guidance.
+### REST Endpoints
 
-## Other Points
-- **Security**: Always keep `LOCAL_FILES_SERVING_ENABLED` false in public multi tenant deployments. Serving local files bypasses media storage authentication, so only trusted operators should enable it.
-- **Docker considerations**: The default container runs Label Studio from `/label-studio`. Mount host folders to `/label-studio/mydata` or `/label-studio/label-studio-data` to take advantage of the auto enablement logic described in the UI.
-- **Error diagnostics**: Users can manually open `/data/local-files/?d=relative/path` in the browser to triage 403 vs 404 issues. 403 usually means missing permissions or disabled serving; 404 means the file path does not map to any registered storage or the file no longer exists on disk.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/storages/localfiles/` | GET, POST | List/create import storages |
+| `/api/storages/localfiles/{id}/` | GET, PATCH, DELETE | Manage specific import storage |
+| `/api/storages/localfiles/{id}/sync` | POST | Trigger sync |
+| `/api/storages/export/localfiles/` | GET, POST | List/create export storages |
+| `/data/local-files/?d={path}` | GET | Serve file content (not a REST endpoint) |
 
+### File Serving Details
+
+The `/data/local-files/` view (`views.py`):
+- Returns `403` if serving disabled or user lacks permission
+- Returns `404` if file doesn't exist or no matching storage
+- Returns `304 Not Modified` if client's `If-None-Match` matches current ETag
+- Supports HTTP Range requests for video/audio seeking
+
+## Files Reference
+
+| File | Purpose |
+|------|---------|
+| `models.py` | Django models, `normalize_storage_path`, validation, signal handlers |
+| `views.py` | `/data/local-files/` endpoint with ETag and range support |
+| `serializers.py` | DRF serializers, path normalization, error formatting |
+| `api.py` | REST API view classes |
+| `functions.py` | `normalize_storage_path`, `autodetect_local_files_root` |
+| `form_layout.yml` | UI form field definitions |
+
+## Troubleshooting
+
+### Common Issues
+
+| Symptom | Cause | Solution |
+|---------|-------|----------|
+| 403 on `/data/local-files/` | Serving disabled | Set `LOCAL_FILES_SERVING_ENABLED=true` |
+| 404 on `/data/local-files/` | No matching storage or file missing | Check storage path is prefix of file path; verify file exists |
+| Validation error on storage creation | Path not under document root | Ensure path starts with `LOCAL_FILES_DOCUMENT_ROOT` |
+| Images show as broken | Path mismatch (trailing slash) | Paths are now normalized; re-sync storage |
+
+### Debug Steps
+
+1. Check environment:
+   ```bash
+   echo $LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED
+   echo $LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT
+   ```
+
+2. Test file access directly:
+   ```
+   curl -I "http://localhost:8080/data/local-files/?d=project1/test.jpg" \
+        -H "Authorization: Token YOUR_API_TOKEN"
+   ```
+
+3. Verify storage configuration in Django shell:
+   ```python
+   from io_storages.localfiles.models import LocalFilesImportStorage
+   for s in LocalFilesImportStorage.objects.all():
+       print(f"{s.project.title}: {s.path}")
+   ```
+
+## Security Considerations
+
+- **Disable by default**: `LOCAL_FILES_SERVING_ENABLED=false` prevents accidental exposure
+- **Path containment**: All requests validated against `LOCAL_FILES_DOCUMENT_ROOT`
+- **Project permissions**: Users can only access files linked to projects they have access to
+- **No directory listing**: Only explicit file paths are served
+
+**Warning**: Do not enable local file serving on public multi-tenant deployments. The feature is designed for on-premise single-tenant environments.
