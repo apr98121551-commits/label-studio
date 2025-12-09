@@ -1,0 +1,62 @@
+# Local Files Storage
+
+## Overview
+Local Files storage allows self hosted Label Studio deployments to serve and synchronize media files directly from the host file system. Projects can reference files with URLs such as `/data/local-files/?d=dataset/image.jpg`, while the backend enforces that every requested path stays inside `LOCAL_FILES_DOCUMENT_ROOT` and that only users with access to the corresponding storage project can download the file. The feature is disabled by default because serving arbitrary local files is a security risk; administrators must opt in via environment variables and project settings.
+
+## Architecture
+```mermaid
+flowchart TD
+    env[Env vars<br/>LOCAL_FILES_SERVING_ENABLED<br/>LOCAL_FILES_DOCUMENT_ROOT] --> serializer[LocalFiles serializers<br/>normalize_storage_path<br/>validate_connection]
+    serializer --> storageModel[LocalFilesImportStorage<br/>LocalFilesExportStorage]
+    storageModel --> migration[0022_normalize_localfiles_paths<br/>canonical data backfill]
+    storageModel --> view[/data/local-files endpoint<br/>localfiles_data]
+    view --> permissionCheck[Prefix match vs normalized storage.path<br/>project permissions enforced]
+    frontend[Storage settings UI<br/>localFiles.tsx] --> serializer
+```
+
+## Key Features
+- **Canonical paths everywhere**: `normalize_storage_path` trims whitespace, converts backslashes, collapses duplicate separators, and runs `os.path.normpath` before any storage is saved or validated.
+- **Safety checks**: `validate_connection` rejects paths outside `LOCAL_FILES_DOCUMENT_ROOT`, paths equal to the document root, and any configuration made while `LOCAL_FILES_SERVING_ENABLED` is false.
+- **Efficient serving**: `/data/local-files` uses a database level prefix filter (`_full_path__startswith=F('path')`) plus per project permission checks so it scales to thousands of storages.
+- **Actionable validation errors**: serializers convert nested Django/DRF error payloads into plain dictionaries/lists for the UI, so users see the exact reason a storage path failed validation.
+- **UI guidance**: the React provider warns when local serving is disabled, suggests default paths, and reminds users to mount host directories in Docker-based setups.
+
+## Usage
+1. **Enable server side settings**:<br/>
+   ```bash
+   export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
+   export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/absolute/path/to/data
+   ```<br/>
+   Restart Label Studio after exporting the variables (or configure them through the process manager).
+2. **Prepare the directory tree**:<br/>
+   - The document root must exist on the host machine.<br/>
+   - Each storage path must be a subdirectory of the document root (for example `/absolute/path/to/data/dataset_a`).<br/>
+   - Use POSIX forward slashes in task data (`/data/local-files/?d=dataset_a/image_1.jpg`). The backend will normalize Windows style paths when you configure the storage.
+3. **Configure the storage in the UI** (`Settings → Storage → Add Source Storage → Local files`):<br/>
+   - The form reads `window.APP_SETTINGS.local_files_document_root` so it can suggest a default path.<br/>
+   - The placeholder and schema enforce absolute paths and remind the user to start with the configured document root.<br/>
+   - If `LOCAL_FILES_SERVING_ENABLED` is false, a destructive alert explains how to enable it. Community Edition users get extra tips about `mydata` and `label-studio-data` convenience folders both for bare metal and containers.
+4. **Verify access**:<br/>
+   - After saving the storage, open `http(s)://<host>/data/local-files/?d=<relative/path>` in a browser. Successful loads confirm both permissions and hostname level CORS settings.<br/>
+   - When importing tasks manually, remember to use relative URLs (everything after `/data/local-files/?d=`).
+
+## API Reference
+- `LocalFilesImportStorage` and `LocalFilesExportStorage` live in `models.py` and inherit from `ProjectStorageMixin`. The import storage generates either blob URLs or JSON tasks depending on configuration.
+- REST endpoints for CRUD, sync, and form layout are defined in `api.py` and exposed under `/api/storages/localfiles/...`.
+- `/data/local-files/` (see `core/views.py`) is the only endpoint that serves binary content. It requires authentication and re-checks both project permissions and on-disk existence every request.
+
+## Development
+- Key files:<br/>
+  - `models.py`: storage models, normalization helper, and validation logic.<br/>
+  - `serializers.py`: DRF serializers that call `normalize_storage_path` and convert validation errors via `_stringify_detail`.<br/>
+  - `migrations/0022_normalize_localfiles_paths.py`: data migration that retrofits canonical paths for existing storages without importing models at import time.<br/>
+  - `web/apps/labelstudio/src/pages/Settings/StorageSettings/providers/localFiles.tsx`: frontend provider that surfaces environment state and default path hints.<br/>
+  - `tests/test_localfiles_serializers.py`, `tests/test_localfiles_view.py`, and `tests/test_localfiles_validation.py`: cover serializers, `/data/local-files` endpoint, and `validate_connection`.
+- Canonical path logic is intentionally duplicated inside the migration to avoid importing Django models when apps are not ready. Keep any future migrations copy-paste aligned with `normalize_storage_path`.
+- When adding new local storage features, update both backend validation (ideally in one shared mixin) and the UI provider so users see consistent guidance.
+
+## Other Points
+- **Security**: Always keep `LOCAL_FILES_SERVING_ENABLED` false in public multi tenant deployments. Serving local files bypasses media storage authentication, so only trusted operators should enable it.
+- **Docker considerations**: The default container runs Label Studio from `/label-studio`. Mount host folders to `/label-studio/mydata` or `/label-studio/label-studio-data` to take advantage of the auto enablement logic described in the UI.
+- **Error diagnostics**: Users can manually open `/data/local-files/?d=relative/path` in the browser to triage 403 vs 404 issues. 403 usually means missing permissions or disabled serving; 404 means the file path does not map to any registered storage or the file no longer exists on disk.
+
