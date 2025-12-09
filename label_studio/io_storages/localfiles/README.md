@@ -6,12 +6,12 @@ Local Files storage allows self hosted Label Studio deployments to serve and syn
 ## Architecture
 ```mermaid
 flowchart TD
-    env[Configuration<br/>ENABLE_LOCAL_FILES_STORAGE<br/>LOCAL_FILES_SERVING_ENABLED<br/>LOCAL_FILES_DOCUMENT_ROOT] --> serializer[LocalFiles serializers<br/>normalize_storage_path<br/>validate_connection]
-    serializer --> storageModel[LocalFilesImportStorage<br/>LocalFilesExportStorage]
-    storageModel --> migration[0022_normalize_localfiles_paths<br/>canonical data backfill]
-    storageModel --> view[/data/local-files endpoint<br/>localfiles_data]
-    view --> permissionCheck[Prefix match vs normalized storage.path<br/>project permissions enforced]
-    frontend[Storage settings UI<br/>localFiles.tsx] --> serializer
+    env[Configuration: ENABLE_LOCAL_FILES_STORAGE; LOCAL_FILES_SERVING_ENABLED; LOCAL_FILES_DOCUMENT_ROOT] --> serializer[LocalFiles serializers: normalize_storage_path + validate_connection]
+    serializer --> storageModel[LocalFilesImportStorage / LocalFilesExportStorage]
+    storageModel --> migration[0022_normalize_localfiles_paths (canonical data backfill)]
+    storageModel --> view[/data/local-files endpoint (localfiles_data)]
+    view --> permissionCheck[Prefix match vs normalized storage.path; project permissions]
+    frontend[Storage settings UI (localFiles.tsx)] --> serializer
 ```
 
 ## Key Features
